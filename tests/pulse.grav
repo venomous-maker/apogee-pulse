@@ -1,0 +1,195 @@
+// apogee-pulse's tests: an app on the router with Pulse's middleware and Orbit
+// on SQLite: routes are counted together ({id}), with latency percentiles,
+// statuses, slow requests, slow queries, exceptions and users; jobs; the
+// database store (adding up across flushes); the server sample; the page, its
+// API and the gate.
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-events"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-queue"
+import "apogee-testing"
+import "grav-orbit"
+import "grav-db"
+import "../src/all.grav"
+use apogee.*
+use orbit.*
+use db.*
+
+class Note extends Model {
+    public id: long = 0
+    public title: string = ""
+}
+
+class Ping extends Job { constructor() {}  fn handle() {} }
+class Broken extends Job { constructor() {}  fn handle() { throw new StateError("no luck") } }
+
+fn setup() -> HttpKernel {
+    let file = Dir.temp() + "/pulse_test_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    Note.createTable()
+    Pulse.use(new MemoryPulseStore())
+    Pulse.recording = true
+    Pulse.slowRequestMs = 50.0
+    Pulse.slowQueryMs = 0.0
+    Pulse.watchQueries()
+    let r = new Router(new Container())
+    r.aliasMiddleware("pulse", fn(args: Array<string>) -> Middleware { return new PulseMiddleware() })
+    r.use("pulse")
+    r.get("/notes/{id}", fn(req: Request) -> Response {
+        Note.find(Integer.parseOr(str(req.route("id")), 0))
+        return Response.json({"ok": true})
+    })
+    r.get("/slow", fn(req: Request) -> Response { Time.sleepMs(80); return Response.json({"ok": true}) })
+    r.get("/boom", fn(req: Request) -> Response { throw new StateError("the flux capacitor broke") })
+    let k = new HttpKernel(r)
+    Pulse.watchExceptions(k)
+    Pulse.routes(r)
+    return k
+}
+
+fn find(rows: Array<PulseRow>, key: string) -> PulseRow {
+    for (r in rows) { if (r.key == key) { return r } }
+    return null
+}
+
+test "routes, statuses, latency, slow requests, queries and exceptions" {
+    let c = new TestClient(setup())
+    for (i in 0..20) { c.getJson("/notes/" + str(i)).assertOk() }
+    c.getJson("/slow").assertOk()
+    c.getJson("/boom").assertServerError()
+    Pulse.flush()
+    let since = Pulse.minuteNow() - 5
+    let routes = Pulse.store.top("request", since, "count", 10)
+    assertEq(routes[0].key, "GET /notes/{id}")
+    assertEq(routes[0].count, 20 as long)
+    assert(find(routes, "GET /slow").max >= 80.0)
+    assertEq(find(Pulse.store.top("status", since, "count", 10), "2xx").count, 21 as long)
+    assertEq(find(Pulse.store.top("status", since, "count", 10), "5xx").count, 1 as long)
+    let slow = Pulse.store.top("slow_request", since, "max", 10)
+    assertEq(slow.size(), 1)
+    assertEq(slow[0].last, "GET /slow")
+    assert(Pulse.store.top("slow_query", since, "count", 10).size() > 0)
+    let ex = Pulse.store.top("exception", since, "count", 10)
+    assertEq(ex.size(), 1)
+    assert(Str.startsWith(ex[0].key, "StateError: the flux capacitor"))
+    assertEq(ex[0].last, "GET /boom")
+    let lat = Pulse.store.top("latency", since, "count", 100)
+    assert(Pulse.percentile(lat, 0.5) <= 25.0)
+    assert(Pulse.percentile(lat, 0.99) >= 50.0)
+}
+
+test "paths become routes" {
+    assertEq(Pulse.normalize("/users/42/posts"), "/users/{id}/posts")
+    assertEq(Pulse.normalize("/orders/0b6c3f8e-6a1d-4c8e-9d8e-2f1a7f3b9c10?x=1"), "/orders/{id}")
+    assertEq(Pulse.normalize("/files/01HZX3K9Q8W2V7N5M4B6C1D0EF"), "/files/{id}")
+    assertEq(Pulse.normalize("/blog/hello-world"), "/blog/hello-world")
+    assertEq(Pulse.normalize("/"), "/")
+    assertEq(Pulse.bucketOf(3.0), "5")
+    assertEq(Pulse.bucketOf(99999.0), "inf")
+}
+
+test "jobs" {
+    Pulse.use(new MemoryPulseStore())
+    Pulse.slowJobMs = 100000.0
+    let c = new Container()
+    let q = new QueueManager(c)
+    q.addConnection("memory", new MemoryQueueDriver())
+    q.defaultConnection = "memory"
+    let events = new Events(c)
+    q.events = events
+    Pulse.watchJobs(events)
+    q.dispatch(new Ping())
+    q.dispatch(new Ping())
+    let b = new Broken()
+    b.tries = 1
+    q.dispatch(b)
+    let o = new WorkerOptions(); o.memoryMb = 0; o.stopWhenEmpty = true
+    q.worker().work("memory", ["default"], o)
+    let d = Pulse.overview(60)
+    assertEq(d.get("jobs").asArray().size(), 1)
+    assertEq(d.get("jobs").at(0).getString("key", ""), "Ping")
+    assertEq(d.get("jobs").at(0).getInt("count", 0), 2)
+    assertEq(d.get("failedJobs").at(0).getString("key", ""), "Broken")
+    assert(Str.contains(d.get("failedJobs").at(0).getString("last", ""), "no luck"))
+    let queue = d.get("queues").at(0)
+    assertEq(queue.getString("queue", ""), "memory:default")
+    assertEq(queue.getInt("queued", 0), 3)
+    assertEq(queue.getInt("processed", 0), 2)
+    assertEq(queue.getInt("failed", 0), 1)
+}
+
+fn checkStore(store: DatabasePulseStore) {
+    store.createTables()
+    store.createTables()
+    store.clear()
+    let m = Pulse.minuteNow()
+    let a = new PulseRow(m, "request", "GET /a"); a.add(3, 30.0, 20.0, "")
+    let b = new PulseRow(m - 1, "request", "GET /a"); b.add(1, 50.0, 50.0, "x")
+    let c = new PulseRow(m, "request", "GET /b"); c.add(5, 5.0, 2.0, "")
+    store.addMany([a, b, c] as Array<PulseRow>)
+    let again = new PulseRow(m, "request", "GET /a"); again.add(2, 10.0, 8.0, "")
+    store.addMany([again] as Array<PulseRow>)
+    let top = store.top("request", m - 10, "count", 10)
+    assertEq(top.size(), 2)
+    assertEq(top[0].key, "GET /a")
+    assertEq(top[0].count, 6 as long)
+    assertEq(top[0].sum, 90.0)
+    assertEq(top[0].max, 50.0)
+    assertEq(top[0].last, "x")
+    assertEq(store.top("request", m - 10, "max", 1)[0].key, "GET /a")
+    assertEq(store.top("request", m - 10, "average", 10)[0].key, "GET /a")
+    let s = store.series("request", "", m - 10)
+    assertEq(s.size(), 2)
+    assertEq(s[1].count, 10 as long)
+    assertEq(store.series("request", "GET /b", m - 10).size(), 1)
+    store.setValue("server", "web-1", "{\"load1\":1}")
+    store.setValue("server", "web-1", "{\"load1\":2}")
+    assertEq(store.values("server").get("web-1"), "{\"load1\":2}")
+    store.prune(m)
+    assertEq(store.series("request", "", m - 10).size(), 1)
+    store.clear()
+    assertEq(store.top("request", 0, "count", 10).size(), 0)
+}
+
+test "the database store adds up" {
+    let file = Dir.temp() + "/pulse_store_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    checkStore(new DatabasePulseStore(new Pool(2, fn() -> Connection { return Sqlite.open(file) })))
+    new File(file).delete()
+}
+
+// With PULSE_MYSQL_URL / PULSE_POSTGRES_URL set (mysql://… / postgres://…).
+test "the database store on MySQL and PostgreSQL" {
+    let my = env("PULSE_MYSQL_URL")
+    if (my != "") { checkStore(new DatabasePulseStore(new Pool(2, fn() -> Connection { return MySql.open(my) }))) }
+    let pg = env("PULSE_POSTGRES_URL")
+    if (pg != "") { checkStore(new DatabasePulseStore(new Pool(2, fn() -> Connection { return Postgres.open(pg) }))) }
+}
+
+test "the server sample" {
+    Pulse.use(new MemoryPulseStore())
+    Pulse.sampleServer()
+    let v = Json.parse(Pulse.store.values("server").get(Pulse.server))
+    assert(v.getInt("cpus", 0) >= 1)
+    assert(v.getInt("processMemory", 0) > 0)
+    let d = Pulse.overview(60)
+    assertEq(d.get("servers").asArray().size(), 1)
+    assertEq(d.get("servers").at(0).get("load").asArray().size(), 60)
+}
+
+test "the page, its API, and the gate" {
+    let c = new TestClient(setup())
+    c.getJson("/notes/1")
+    c.get("/pulse").assertOk().assertSee("<title>Pulse</title>")
+    c.getJson("/pulse/api/overview").assertOk().assertJsonPath("requests", 1).assertJsonPath("routes.0.key", "GET /notes/{id}")
+    c.getJson("/pulse/api/overview?period=7d").assertOk().assertJsonPath("minutes", 10080)
+    c.getJson("/pulse/api/overview").assertJsonPath("requests", 1)          // the dashboard's own requests are not counted
+    c.postJson("/pulse/api/clear", null).assertOk()
+    c.getJson("/pulse/api/overview").assertJsonPath("requests", 0)
+    c.remote = "203.0.113.5:9999"
+    c.getJson("/pulse/api/overview").assertForbidden()
+}
