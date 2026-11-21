@@ -6,6 +6,10 @@ compiler versions it builds with.
 
 ## Unreleased
 
+- Cheaper recording: one lock per request, buffers sharded by thread (four
+  threads recording at once no longer wait on each other), and routes found in
+  one pass (about 4 times faster).
+
 ## 0.1.1 (2026-11-21)
 
 - A request that ends in an `HttpException` (a 404 from the router, say) is
