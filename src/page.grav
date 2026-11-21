@@ -1,0 +1,137 @@
+// page.grav — Pulse's page: one HTML file with its CSS and script (no build
+// step, nothing fetched from elsewhere), over /api/overview.
+import "std"
+
+namespace apogee {
+
+    class PulsePage {
+        static fn html(base: string) -> string { return Str.replace(PulsePage.template(), "__BASE__", base); }
+
+        private static fn template() -> string {
+            return r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse</title>
+<style>
+:root { --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec; --accent: #d9480f;
+        --ok: #1e8e4a; --warn: #b7791f; --bad: #c53030; --bar: #f08c5a; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #11141a; --panel: #1a1f28; --text: #e6e9ef; --muted: #8e97a8; --line: #2a313d; --accent: #ff8a50;
+          --ok: #48bb78; --warn: #ecc94b; --bad: #fc8181; --bar: #c2410c; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 10px; padding: 14px 24px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 18px; margin: 0 auto 0 0; }
+header h1 span { color: var(--accent); }
+button { font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+button.on, button:hover { border-color: var(--accent); color: var(--accent); }
+main { padding: 18px 24px; display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; }
+.wide { grid-column: 1 / -1; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+section h2 { font-size: 13px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+.stat { padding: 14px; border-right: 1px solid var(--line); }
+.stat:last-child { border-right: none; }
+.stat b { display: block; font-size: 24px; font-variant-numeric: tabular-nums; }
+.stat small { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th, td { text-align: left; padding: 7px 14px; border-bottom: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+tr:last-child td { border-bottom: none; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.n, th.n { text-align: right; width: 90px; font-variant-numeric: tabular-nums; }
+td code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+td small { color: var(--muted); display: block; }
+.empty { color: var(--muted); padding: 14px; }
+.chart { display: flex; align-items: flex-end; gap: 2px; height: 90px; padding: 10px 14px; }
+.chart div { flex: 1; background: var(--bar); border-radius: 2px 2px 0 0; min-height: 1px; }
+.servers { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.server { padding: 12px 14px; border-right: 1px solid var(--line); }
+.meter { height: 6px; background: var(--line); border-radius: 3px; margin: 4px 0 8px; overflow: hidden; }
+.meter i { display: block; height: 100%; background: var(--accent); }
+.bad { color: var(--bad); } .warn { color: var(--warn); } .ok { color: var(--ok); }
+@media (max-width: 520px) { main { grid-template-columns: 1fr; padding: 12px 16px; } header { padding: 12px 16px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>●</span> Pulse</h1>
+  <button data-p="1h" class="on">1 hour</button><button data-p="6h">6 hours</button><button data-p="24h">24 hours</button><button data-p="7d">7 days</button>
+</header>
+<main id="main"><p class="empty">Loading…</p></main>
+<script>
+const base = "__BASE__";
+let period = "1h", last = "";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const num = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? (n / 1e3).toFixed(1) + "k" : String(n);
+const ms = n => n >= 1000 ? (n / 1000).toFixed(2) + " s" : Math.round(n) + " ms";
+const bytes = n => n >= 1073741824 ? (n / 1073741824).toFixed(1) + " GB" : (n / 1048576).toFixed(0) + " MB";
+function table(title, rows, cols, wide) {
+  const body = rows.length ? `<table><tr>${cols.map(c => `<th class="${c[2] || ""}">${c[0]}</th>`).join("")}</tr>` +
+    rows.map(r => `<tr>${cols.map(c => `<td class="${c[2] || ""}" title="${esc(typeof c[1] === "function" ? "" : r[c[1]])}">${typeof c[1] === "function" ? c[1](r) : esc(r[c[1]])}</td>`).join("")}</tr>`).join("") + `</table>`
+    : `<p class="empty">Nothing yet.</p>`;
+  return `<section class="${wide ? "wide" : ""}"><h2>${title}</h2>${body}</section>`;
+}
+function chart(points, key) {
+  const max = Math.max(1, ...points.map(p => p[key]));
+  return `<div class="chart">${points.map(p => `<div style="height:${Math.max(1, p[key] / max * 100)}%" title="${new Date(p.minute * 60000).toLocaleTimeString()} · ${key === "count" ? num(p[key]) : p[key]}"></div>`).join("")}</div>`;
+}
+function render(d) {
+  const failRate = d.requests ? (d.failedRequests / d.requests * 100) : 0;
+  let h = `<section class="wide"><div class="stats">
+    <div class="stat"><b>${num(d.requests)}</b><small>requests</small></div>
+    <div class="stat"><b class="${failRate > 1 ? "bad" : "ok"}">${failRate.toFixed(2)}%</b><small>failed (5xx)</small></div>
+    <div class="stat"><b>${ms(d.p50)}</b><small>p50 (bucket)</small></div>
+    <div class="stat"><b class="${d.p95 > 1000 ? "warn" : ""}">${ms(d.p95)}</b><small>p95</small></div>
+    <div class="stat"><b class="${d.p99 > 2500 ? "bad" : ""}">${ms(d.p99)}</b><small>p99</small></div>
+    <div class="stat"><b>${num(d.exceptions.reduce((a, e) => a + e.count, 0))}</b><small>exceptions</small></div>
+    <div class="stat"><b>${num(d.jobs.reduce((a, e) => a + e.count, 0))}</b><small>jobs done</small></div>
+  </div></section>`;
+  h += `<section class="wide"><h2>Throughput</h2>${chart(d.throughput, "count")}</section>`;
+  if (d.servers.length) {
+    h += `<section class="wide"><h2>Servers</h2><div class="servers">${d.servers.map(s => {
+      const memPct = s.memoryTotal ? s.memoryUsed / s.memoryTotal * 100 : 0;
+      const loadPct = Math.min(100, s.load1 / Math.max(1, s.cpus) * 100);
+      const stale = Date.now() - s.at > 60000;
+      return `<div class="server"><b>${esc(s.name)}</b> <small class="${stale ? "bad" : "ok"}">${stale ? "silent since " + new Date(s.at).toLocaleTimeString() : "reporting"}</small>
+        <div><small>Load ${s.load1.toFixed(2)} / ${s.load5.toFixed(2)} / ${s.load15.toFixed(2)} on ${s.cpus} CPUs</small></div><div class="meter"><i style="width:${loadPct}%"></i></div>
+        <div><small>Memory ${bytes(s.memoryUsed)} of ${bytes(s.memoryTotal)} · this process ${bytes(s.processMemory)}</small></div><div class="meter"><i style="width:${memPct}%"></i></div>
+        ${chart(s.load, "max")}</div>`;
+    }).join("")}</div></section>`;
+  }
+  const count = ["Count", r => num(r.count), "n"], avg = ["Average", r => ms(r.average), "n"], max = ["Slowest", r => ms(r.max), "n"];
+  h += table("Busiest routes", d.routes, [["Route", r => `<code>${esc(r.key)}</code>`], count, avg]);
+  h += table("Slowest routes", d.slowRoutes, [["Route", r => `<code>${esc(r.key)}</code>`], avg, max]);
+  h += table("Slow requests", d.slowRequests, [["Route", r => `<code>${esc(r.key)}</code><small>${esc(r.last)}</small>`], count, max]);
+  h += table("Exceptions", d.exceptions, [["Exception", r => `${esc(r.key)}<small>${esc(r.last)}</small>`], count]);
+  h += table("Slow queries", d.slowQueries, [["Query", r => `<code>${esc(r.key)}</code><small>${esc(r.last)}</small>`], count, max], true);
+  h += table("Queues", d.queues, [["Queue", "queue"], ["Queued", r => num(r.queued), "n"], ["Processed", r => num(r.processed), "n"], ["Failed", r => `<span class="${r.failed ? "bad" : ""}">${num(r.failed)}</span>`, "n"]]);
+  h += table("Jobs", d.jobs, [["Job", "key"], count, avg]);
+  h += table("Failed jobs", d.failedJobs, [["Job", r => `${esc(r.key)}<small>${esc(r.last)}</small>`], count]);
+  h += table("Slow jobs", d.slowJobs, [["Job", r => `${esc(r.key)}<small>${esc(r.last)}</small>`], count, max]);
+  h += table("Busiest users", d.users, [["User", "key"], ["Requests", r => num(r.count), "n"], avg]);
+  h += table("Status codes", d.statuses, [["Class", r => `<span class="${r.key === "5xx" ? "bad" : r.key === "4xx" ? "warn" : ""}">${esc(r.key)}</span>`], count, avg]);
+  document.getElementById("main").innerHTML = h;
+}
+async function load() {
+  try {
+    const r = await fetch(`${base}/api/overview?period=${period}`, {headers: {Accept: "application/json"}});
+    const text = await r.text();
+    if (text !== last) { last = text; render(JSON.parse(text)); }
+  } catch (e) {}
+}
+document.querySelectorAll("header button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("header button").forEach(x => x.classList.toggle("on", x === b));
+  period = b.dataset.p; last = ""; load();
+});
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>
+""";
+        }
+    }
+}
