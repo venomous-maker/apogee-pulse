@@ -1,0 +1,428 @@
+// pulse.grav — production monitoring for Apogee apps: throughput and latency
+// per route, slow requests, slow queries, exceptions, queue throughput and
+// failures, the busiest users, and each server's memory and load, shown at
+// /pulse. Unlike Telescope it keeps no requests, only per-minute counts, so it
+// is cheap enough to leave on.
+//
+//   Pulse.use(new DatabasePulseStore(pool))      // or the memory store (the default)
+//   router.use(...) a PulseMiddleware             // requests, slow requests, users
+//   Pulse.watchQueries()                          // slow queries (Orbit's DB.listen)
+//   Pulse.watchExceptions(kernel)                 // what the HTTP kernel reports
+//   Pulse.watchJobs(events)                       // the queue's events
+//   Pulse.start()                                 // flushes every few seconds, and samples this server
+//   Pulse.routes(router)                          // the page
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-events"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-queue"
+import "grav-orbit"
+import "store.grav"
+import "page.grav"
+use orbit.*
+
+namespace apogee {
+
+    class Pulse {
+        static store: PulseStore = new MemoryPulseStore()
+        static recording: bool = true
+        // Requests, queries and jobs slower than these (ms) are listed as slow.
+        static slowRequestMs: double = 1000.0
+        static slowQueryMs: double = 1000.0
+        static slowJobMs: double = 1000.0
+        // Only this share of requests is counted (1.0: all); counts are scaled back up.
+        static sampleRate: double = 1.0
+        // Request paths not counted (prefixes; the dashboard's own never are).
+        static ignorePaths: Array<string> = new Array<string>()
+        // How a signed-in user is named in the usage list (default: its id, or its text).
+        static userKey: fn(any) -> string = null
+        // How often the buffer is written out and the server sampled (ms), and how long minutes are kept (hours).
+        static flushMs: int = 5000
+        static keepHours: int = 168
+        // The latency buckets (ms): a request counts in the first it fits under.
+        static buckets: Array<double> = [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0]
+        // The name this server reports as.
+        static server: string = OS.hostname()
+        private static gate: fn(Request) -> bool = null
+        private static base: string = "/pulse"
+        private static buffer: HashMap<string, PulseRow> = new HashMap<string, PulseRow>()
+        private static lock: Mutex = new Mutex()
+        private static running: AtomicInt = new AtomicInt(0)
+        private static sampled: AtomicInt = new AtomicInt(0)
+
+        static fn use(s: PulseStore) { Pulse.store = s; }
+        // Who may see the dashboard (default: this machine only).
+        static fn setGate(allow: fn(Request) -> bool) { Pulse.gate = allow; }
+        static fn minuteNow() -> long { return Time.nowMs() / 60000; }
+
+        // ── recording ──────────────────────────────────────────────────────────
+        // Adds one occurrence of `type`/`key` (with a value, as ms or anything
+        // else to sum and take the maximum of) to this minute.
+        static fn record(type: string, key: string, value: double = 0.0, detail: string = "", count: long = 1) {
+            if (!Pulse.recording) { return; }
+            let minute = Pulse.minuteNow();
+            let k = type + "\u{1}" + key + "\u{1}" + str(minute);
+            Pulse.lock.lock();
+            let r = Pulse.buffer.getOr(k, null);
+            if (r == null) { r = new PulseRow(minute, type, key); Pulse.buffer.put(k, r); }
+            r.add(count, value * (count as double), value, detail);
+            Pulse.lock.unlock();
+        }
+        // Writes what is buffered to the store (Pulse.start does this every few seconds).
+        static fn flush() {
+            Pulse.lock.lock();
+            let rows = Pulse.buffer.values();
+            Pulse.buffer.clear();
+            Pulse.lock.unlock();
+            if (rows.size() == 0) { return; }
+            try { Pulse.store.addMany(rows); } catch (e: Exception) {
+                // (kept for the next try, unless the buffer has grown since)
+                Pulse.lock.lock();
+                if (Pulse.buffer.size() < 10000) {
+                    for (r in rows) {
+                        let k = r.type + "\u{1}" + r.key + "\u{1}" + str(r.minute);
+                        let have = Pulse.buffer.getOr(k, null);
+                        if (have == null) { Pulse.buffer.put(k, r); } else { have.add(r.count, r.sum, r.max, r.last); }
+                    }
+                }
+                Pulse.lock.unlock();
+            }
+        }
+        // Samples this server: memory (this process's and the machine's), load, CPUs.
+        static fn sampleServer() {
+            let o = Json.object();
+            o.set("name", Pulse.server);
+            o.set("cpus", OS.cpuCount() as long);
+            o.set("processMemory", Process.memoryUsage());
+            let mem = Pulse.meminfo();
+            o.set("memoryTotal", mem[0]);
+            o.set("memoryUsed", mem[0] - mem[1]);
+            let load = Pulse.loadavg();
+            o.set("load1", load[0]);
+            o.set("load5", load[1]);
+            o.set("load15", load[2]);
+            o.set("at", Time.nowMs());
+            try { Pulse.store.setValue("server", Pulse.server, o.toJson()); } catch (e: Exception) {}
+            // and a series of this server's load and memory, for the charts
+            Pulse.record("server_load", Pulse.server, load[0]);
+            Pulse.record("server_memory", Pulse.server, ((mem[0] - mem[1]) / 1048576) as double);
+        }
+        // Total and available bytes (0 where /proc/meminfo is missing).
+        private static fn meminfo() -> Array<long> {
+            let out: Array<long> = [0 as long, 0 as long];
+            let f = new File("/proc/meminfo");
+            if (!f.exists()) { return out; }
+            for (line in Str.split(f.read(), "\n")) {
+                let parts = Str.split(Str.trim(line), ":");
+                if (parts.size() < 2) { continue; }
+                let kb = Integer.parseOr(Str.trim(Str.replace(parts[1], "kB", "")), 0);
+                if (parts[0] == "MemTotal") { out[0] = kb * 1024; }
+                if (parts[0] == "MemAvailable") { out[1] = kb * 1024; }
+            }
+            return out;
+        }
+        private static fn loadavg() -> Array<double> {
+            let out: Array<double> = [0.0, 0.0, 0.0];
+            let f = new File("/proc/loadavg");
+            if (!f.exists()) { return out; }
+            let parts = Str.split(Str.trim(f.read()), " ");
+            for (i in 0..3) { if (i < parts.size()) { out[i] = Float.parseOr(parts[i], 0.0); } }
+            return out;
+        }
+        // A background thread: flushes every `flushMs`, samples the server every
+        // 15 s, and drops minutes older than `keepHours` once an hour.
+        static fn start() {
+            if (Pulse.running.get() == 1) { return; }
+            Pulse.running.set(1);
+            Thread.spawn("pulse", fn() {
+                let lastSample: long = 0;
+                let lastPrune: long = 0;
+                while (Pulse.running.get() == 1) {
+                    let now = Time.nowMs();
+                    if (now - lastSample >= 15000) { Pulse.sampleServer(); lastSample = now; }
+                    Pulse.flush();
+                    if (now - lastPrune >= 3600000) {
+                        try { Pulse.store.prune(Pulse.minuteNow() - (Pulse.keepHours as long) * 60); } catch (e: Exception) {}
+                        lastPrune = now;
+                    }
+                    let waited = 0;
+                    while (waited < Pulse.flushMs && Pulse.running.get() == 1) { Time.sleepMs(100); waited += 100; }
+                }
+                Pulse.flush();
+            });
+        }
+        static fn stop() { Pulse.running.set(0); }
+
+        // A request: throughput per route, status classes, latency buckets,
+        // slow ones, and its user.
+        static fn recordRequest(method: string, path: string, status: int, ms: double, user: string) {
+            let scale = Pulse.sampleRate >= 1.0 ? 1 as long : (1.0 / Pulse.sampleRate) as long;
+            let route = method + " " + Pulse.normalize(path);
+            Pulse.record("request", route, ms, "", scale);
+            Pulse.record("status", str(status / 100) + "xx", ms, "", scale);
+            Pulse.record("latency", Pulse.bucketOf(ms), ms, "", scale);
+            if (status >= 500) { Pulse.record("failed_request", route, ms, str(status), scale); }
+            if (ms >= Pulse.slowRequestMs) { Pulse.record("slow_request", route, ms, method + " " + path); }
+            if (user != "") { Pulse.record("user", user, ms, "", scale); }
+        }
+        // Whether this request is counted (sampling).
+        static fn sample() -> bool {
+            if (Pulse.sampleRate >= 1.0) { return true; }
+            let every = (1.0 / Pulse.sampleRate) as int;
+            return every <= 1 || Pulse.sampled.increment() % every == 0;
+        }
+        static fn bucketOf(ms: double) -> string {
+            for (b in Pulse.buckets) { if (ms <= b) { return str(b as long); } }
+            return "inf";
+        }
+        // A path as a route: numbers, UUIDs and long hex or random-looking
+        // segments become {id}, so /users/42 and /users/43 count together.
+        static fn normalize(path: string) -> string {
+            let q = Str.indexOf(path, "?");
+            let p = q >= 0 ? path[..q] : path;
+            let out = new Array<string>();
+            for (seg in Str.split(p, "/")) {
+                if (seg == "") { continue; }
+                out.push(Pulse.isId(seg) ? "{id}" : seg);
+            }
+            return "/" + Str.join(out, "/");
+        }
+        private static fn isId(s: string) -> bool {
+            let digits = 0;
+            let hex = 0;
+            let letters = 0;
+            for (i in 0..s.length) {
+                let c = Str.charAt(s, i);
+                if (c >= 48 && c <= 57) { digits += 1; hex += 1; }                              // 0-9
+                else if ((c >= 97 && c <= 102) || (c >= 65 && c <= 70)) { hex += 1; letters += 1; }   // a-f A-F
+                else if (c == 45 || c == 95) { hex += 1; }                                       // - _
+                else if ((c >= 103 && c <= 122) || (c >= 71 && c <= 90)) { letters += 1; }
+            }
+            if (digits == s.length) { return true; }
+            if (s.length >= 16 && hex == s.length && digits > 0) { return true; }      // uuids, hashes
+            if (s.length >= 20 && digits >= 3 && digits + letters >= s.length - 2) { return true; }   // ulids, tokens
+            return false;
+        }
+
+        // ── watchers ───────────────────────────────────────────────────────────
+        // Slow queries (DB.listen), by statement.
+        static fn watchQueries() {
+            DB.listen(fn(q: QueryEvent) {
+                let ms = q.ms as double;
+                if (ms >= Pulse.slowQueryMs) { Pulse.record("slow_query", q.sql, ms, q.connection); }
+            });
+        }
+        // What the HTTP kernel reports, by kind and message.
+        static fn watchExceptions(kernel: HttpKernel) {
+            kernel.report(fn(e: Exception, req: Request) { Pulse.recordException(e, req.method() + " " + req.path()); });
+        }
+        static fn recordException(e: Exception, where: string = "") {
+            let msg = e.message();
+            if (msg.length > 300) { msg = msg[..300] + "…"; }
+            Pulse.record("exception", e.kind() + ": " + msg, 0.0, where);
+        }
+        // The queue: queued and processed per job and per queue, run times, failures, slow jobs.
+        static fn watchJobs(events: Events) {
+            events.listen::<JobQueued>(fn(e: JobQueued) { Pulse.record("queued", e.connection + ":" + e.queue); });
+            events.listen::<JobProcessed>(fn(e: JobProcessed) {
+                let ms = e.ms as double;
+                Pulse.record("job", e.job, ms);
+                Pulse.record("processed", e.connection + ":" + e.queue, ms);
+                if (ms >= Pulse.slowJobMs) { Pulse.record("slow_job", e.job, ms, e.queue); }
+            });
+            events.listen::<JobFailed>(fn(e: JobFailed) {
+                Pulse.record("failed_job", e.job, 0.0, e.exception == null ? "" : e.exception.kind() + ": " + e.exception.message());
+                Pulse.record("failed", e.connection + ":" + e.queue);
+            });
+        }
+
+        // ── reading ────────────────────────────────────────────────────────────
+        // Everything the page shows, over the last `minutes`.
+        static fn overview(minutes: long) -> JsonValue {
+            Pulse.flush();
+            let since = Pulse.minuteNow() - minutes + 1;
+            let s = Pulse.store;
+            let o = Json.object();
+            o.set("minutes", minutes);
+            o.set("recording", Pulse.recording);
+            // totals and latency
+            let total: long = 0;
+            let failed: long = 0;
+            for (r in s.top("status", since, "count", 10)) { total += r.count; if (r.key == "5xx") { failed += r.count; } }
+            o.set("requests", total);
+            o.set("failedRequests", failed);
+            let lat = s.top("latency", since, "count", 100);
+            o.set("p50", Pulse.percentile(lat, 0.50));
+            o.set("p95", Pulse.percentile(lat, 0.95));
+            o.set("p99", Pulse.percentile(lat, 0.99));
+            o.set("throughput", Pulse.seriesJson(s.series("request", "", since), since, minutes));
+            o.set("statuses", Pulse.rowsJson(s.top("status", since, "count", 10)));
+            o.set("routes", Pulse.rowsJson(s.top("request", since, "count", 15)));
+            o.set("slowRoutes", Pulse.rowsJson(s.top("request", since, "average", 10)));
+            o.set("slowRequests", Pulse.rowsJson(s.top("slow_request", since, "max", 10)));
+            o.set("slowQueries", Pulse.rowsJson(s.top("slow_query", since, "max", 10)));
+            o.set("exceptions", Pulse.rowsJson(s.top("exception", since, "count", 10)));
+            o.set("users", Pulse.rowsJson(s.top("user", since, "count", 10)));
+            o.set("jobs", Pulse.rowsJson(s.top("job", since, "count", 10)));
+            o.set("failedJobs", Pulse.rowsJson(s.top("failed_job", since, "count", 10)));
+            o.set("slowJobs", Pulse.rowsJson(s.top("slow_job", since, "max", 10)));
+            let queues = Json.array();
+            let byQueue = new HashMap<string, JsonValue>();
+            for (type in ["queued", "processed", "failed"]) {
+                for (r in s.top(type, since, "count", 50)) {
+                    let q = byQueue.getOr(r.key, null);
+                    if (q == null) {
+                        q = Json.object();
+                        q.set("queue", r.key);
+                        q.set("queued", 0 as long); q.set("processed", 0 as long); q.set("failed", 0 as long);
+                        byQueue.put(r.key, q);
+                        queues.push(q);
+                    }
+                    q.set(type, r.count);
+                }
+            }
+            o.set("queues", queues);
+            let servers = Json.array();
+            for ((name, v) in s.values("server")) {
+                let sv = Json.tryParse(v);
+                if (sv == null) { continue; }
+                sv.set("load", Pulse.seriesJson(s.series("server_load", name, since), since, minutes));
+                servers.push(sv);
+            }
+            o.set("servers", servers);
+            return o;
+        }
+        // The bucket a share of requests is under (an upper bound, in ms).
+        static fn percentile(buckets: Array<PulseRow>, p: double) -> double {
+            let total: long = 0;
+            for (b in buckets) { total += b.count; }
+            if (total == 0) { return 0.0; }
+            let sorted = buckets.copy();
+            sorted.sortBy(fn(a: PulseRow, b: PulseRow) -> int {
+                let x = a.key == "inf" ? 1.0e18 : Float.parseOr(a.key, 0.0);
+                let y = b.key == "inf" ? 1.0e18 : Float.parseOr(b.key, 0.0);
+                return x < y ? -1 : (x > y ? 1 : 0);
+            });
+            let want = (total as double) * p;
+            let seen: long = 0;
+            for (b in sorted) {
+                seen += b.count;
+                if ((seen as double) >= want) { return b.key == "inf" ? b.max : Float.parseOr(b.key, 0.0); }
+            }
+            return 0.0;
+        }
+        private static fn rowsJson(rows: Array<PulseRow>) -> JsonValue {
+            let a = Json.array();
+            for (r in rows) {
+                let o = Json.object();
+                o.set("key", r.key);
+                o.set("count", r.count);
+                o.set("average", Math.round(r.average() * 10.0) / 10.0);
+                o.set("max", Math.round(r.max * 10.0) / 10.0);
+                o.set("last", r.last);
+                a.push(o);
+            }
+            return a;
+        }
+        // One point per bucket of the period (at most 60), zeros where nothing happened.
+        private static fn seriesJson(rows: Array<PulseRow>, since: long, minutes: long) -> JsonValue {
+            let step = minutes <= 60 ? 1 as long : minutes / 60;
+            let n = (minutes + step - 1) / step;
+            let counts = new Array<long>();
+            let maxes = new Array<double>();
+            for (i in 0..n) { counts.push(0); maxes.push(0.0); }
+            for (r in rows) {
+                let i = (r.minute - since) / step;
+                if (i < 0 || i >= n) { continue; }
+                counts[i] = counts[i] + r.count;
+                if (r.max > maxes[i]) { maxes[i] = r.max; }
+            }
+            let a = Json.array();
+            for (i in 0..n) {
+                let p = Json.object();
+                p.set("minute", since + i * step);
+                p.set("count", counts[i]);
+                p.set("max", maxes[i]);
+                a.push(p);
+            }
+            return a;
+        }
+
+        // ── the web side ───────────────────────────────────────────────────────
+        static fn routes(router: Router, prefix: string = "pulse") {
+            let p = "/" + Str.trim(prefix);
+            while (Str.endsWith(p, "/") && p.length > 1) { p = p[..p.length - 1]; }
+            Pulse.base = p;
+            let base = p;
+            router.get(base, Pulse.guard(fn(req: Request) -> Response { return Response.html(PulsePage.html(base)); }));
+            router.get(base + "/api/overview", Pulse.guard(fn(req: Request) -> Response {
+                let period = req.query("period", "1h");
+                return new Response(HttpResponse.json(200, Pulse.overview(Pulse.periodMinutes(period))));
+            }));
+            router.post(base + "/api/clear", Pulse.guard(fn(req: Request) -> Response {
+                Pulse.flush();
+                Pulse.store.clear();
+                return Response.json({"cleared": true});
+            }));
+        }
+        // "1h", "6h", "24h", "7d" (or a number of minutes).
+        static fn periodMinutes(period: string) -> long {
+            switch (period) {
+                case "6h": return 360
+                case "24h": return 1440
+                case "7d": return 10080
+                case "1h": return 60
+                default: {
+                    let n = Integer.parseOr(period, 60);
+                    return n < 1 ? 60 as long : (n > 10080 ? 10080 as long : n);
+                }
+            }
+        }
+        static fn isDashboardPath(path: string) -> bool { return Str.startsWith(path, Pulse.base); }
+        private static fn guard(h: fn(Request) -> Response) -> fn(Request) -> Response {
+            return fn(req: Request) -> Response {
+                let g = Pulse.gate;
+                let allowed = g == null ? Pulse.local(req) : g(req);
+                if (!allowed) { return Response.json({"message": "Forbidden."}, 403); }
+                return h(req);
+            };
+        }
+        static fn local(req: Request) -> bool {
+            let r = req.http.remote;
+            return Str.startsWith(r, "127.") || Str.startsWith(r, "[::1]") || Str.startsWith(r, "::1") || r == "";
+        }
+        static fn keyOfUser(user: any) -> string {
+            if (user == null) { return ""; }
+            let f = Pulse.userKey;
+            if (f != null) { return f(user); }
+            if (user is Model) {
+                let info = ClassInfo.of(user);
+                if (info != null) {
+                    let map = TableMap.of(info);
+                    if (map.id != null) { return info.name + "#" + str(map.id.field.get(user)); }
+                }
+            }
+            return str(user);
+        }
+    }
+
+    // Counts each request.
+    class PulseMiddleware implements Middleware {
+        constructor() {}
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            let path = req.path();
+            if (!Pulse.recording || Pulse.isDashboardPath(path) || !Pulse.sample()) { return next(req); }
+            for (p in Pulse.ignorePaths) { if (Str.startsWith(path, p)) { return next(req); } }
+            let started = Time.monotonicNs();
+            let res: Response = null;
+            let failure: Exception = null;
+            try { res = next(req); } catch (e: Exception) { failure = e; }
+            let ms = (Time.monotonicNs() - started) as double / 1000000.0;
+            Pulse.recordRequest(req.method(), path, res == null ? 500 : res.http.status, ms, Pulse.keyOfUser(req.user));
+            if (failure != null) { throw failure; }
+            return res;
+        }
+    }
+}
