@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-21)
+
 - `Pulse`: per-minute counts of requests (per route, status class and latency
   bucket), slow requests, slow queries, exceptions, jobs and queues, users,
   and server load and memory; buffered and flushed by a background thread;
