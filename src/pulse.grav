@@ -23,6 +23,43 @@ import "store.grav"
 import "page.grav"
 use orbit.*
 
+%{
+/* A request path as a route (Pulse.normalize, on every request): the query
+   string dropped, empty segments skipped, and a segment that looks like an id
+   written {id}: all digits; 16 or more hex digits, `-` and `_` with a digit
+   among them (uuids, hashes); 20 or more characters, nearly all letters and
+   digits, 3 or more of them digits (ulids, tokens). One pass, in C: a Grav
+   loop over the characters pays a call (and a reference count) for each one. */
+static const char* apogee_pulse_route(const char* s) {
+    size_t n = 0;
+    while (s[n] && s[n] != '?') n++;
+    char* out = (char*)malloc(n * 3 + 8);
+    size_t o = 0, i = 0;
+    while (i <= n) {
+        size_t start = i, digits = 0, hex = 0, letters = 0;
+        for (; i < n && s[i] != '/'; i++) {
+            unsigned char c = (unsigned char)s[i];
+            if (c >= '0' && c <= '9') { digits++; hex++; }
+            else if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) { hex++; letters++; }
+            else if (c == '-' || c == '_') hex++;
+            else if ((c >= 'g' && c <= 'z') || (c >= 'G' && c <= 'Z')) letters++;
+        }
+        size_t len = i - start;
+        if (len > 0) {
+            out[o++] = '/';
+            int id = digits == len || (len >= 16 && hex == len && digits > 0) ||
+                     (len >= 20 && digits >= 3 && digits + letters + 2 >= len);
+            if (id) { memcpy(out + o, "{id}", 4); o += 4; }
+            else { memcpy(out + o, s + start, len); o += len; }
+        }
+        i++;
+    }
+    if (o == 0) out[o++] = '/';
+    out[o] = 0;
+    return grav_str_take(out);
+}
+%}
+
 namespace apogee {
 
     class Pulse {
@@ -47,8 +84,9 @@ namespace apogee {
         static server: string = OS.hostname()
         private static gate: fn(Request) -> bool = null
         private static base: string = "/pulse"
-        private static buffer: HashMap<string, PulseRow> = new HashMap<string, PulseRow>()
-        private static lock: Mutex = new Mutex()
+        // What is recorded waits here, in shards each with its own lock (a thread
+        // keeps to one), so threads recording at once seldom wait on each other.
+        private static shards: Array<PulseShard> = PulseShard.make(16)
         private static running: AtomicInt = new AtomicInt(0)
         private static sampled: AtomicInt = new AtomicInt(0)
 
@@ -69,34 +107,43 @@ namespace apogee {
         static fn record(type: string, key: string, value: double = 0.0, detail: string = "", count: long = 1) {
             if (!Pulse.recording) { return; }
             let minute = Pulse.minuteNow();
-            let k = type + "\u{1}" + key + "\u{1}" + str(minute);
-            Pulse.lock.lock();
-            let r = Pulse.buffer.getOr(k, null);
-            if (r == null) {
-                r = new PulseRow(minute, type, key)
-                Pulse.buffer.put(k, r)
-            }
-            r.add(count, value * (count as double), value, detail);
-            Pulse.lock.unlock();
+            let m = str(minute);
+            let s = Pulse.shard();
+            s.lock.lock();
+            s.add(type, key, value, detail, count, minute, m);
+            s.lock.unlock();
+        }
+        // This thread's shard (pthread ids are addresses: their low bits are alike).
+        private static fn shard() -> PulseShard {
+            let id = Thread.currentId();
+            return Pulse.shards[((id >> 12) ^ (id >> 20) ^ (id >> 28)) & 15];
         }
         // Writes what is buffered to the store (Pulse.start does this every few seconds).
         static fn flush() {
-            Pulse.lock.lock();
-            let rows = Pulse.buffer.values();
-            Pulse.buffer.clear();
-            Pulse.lock.unlock();
-            if (rows.size() == 0) { return; }
-            try { Pulse.store.addMany(rows); } catch (e: Exception) {
+            // (the shards' rows merged: one row per type, key and minute)
+            let merged = new HashMap<string, PulseRow>();
+            for (s in Pulse.shards) {
+                s.lock.lock();
+                let rows = s.buffer;
+                s.buffer = new HashMap<string, PulseRow>();
+                s.lock.unlock();
+                for ((k, r) in rows) {
+                    let have = merged.getOr(k, null);
+                    if (have == null) { merged.put(k, r); } else { have.add(r.count, r.sum, r.max, r.last); }
+                }
+            }
+            if (merged.isEmpty()) { return; }
+            try { Pulse.store.addMany(merged.values()); } catch (e: Exception) {
                 // (kept for the next try, unless the buffer has grown since)
-                Pulse.lock.lock();
-                if (Pulse.buffer.size() < 10000) {
-                    for (r in rows) {
-                        let k = r.type + "\u{1}" + r.key + "\u{1}" + str(r.minute);
-                        let have = Pulse.buffer.getOr(k, null);
-                        if (have == null) { Pulse.buffer.put(k, r); } else { have.add(r.count, r.sum, r.max, r.last); }
+                let s = Pulse.shards[0];
+                s.lock.lock();
+                if (s.buffer.size() < 10000) {
+                    for ((k, r) in merged) {
+                        let have = s.buffer.getOr(k, null);
+                        if (have == null) { s.buffer.put(k, r); } else { have.add(r.count, r.sum, r.max, r.last); }
                     }
                 }
-                Pulse.lock.unlock();
+                s.lock.unlock();
             }
         }
         // Samples this server: memory (this process's and the machine's), load, CPUs.
@@ -175,14 +222,23 @@ namespace apogee {
         // A request: throughput per route, status classes, latency buckets,
         // slow ones, and its user.
         static fn recordRequest(method: string, path: string, status: int, ms: double, user: string) {
+            if (!Pulse.recording) { return; }
             let scale = Pulse.sampleRate >= 1.0 ? 1 as long : (1.0 / Pulse.sampleRate) as long;
             let route = method + " " + Pulse.normalize(path);
-            Pulse.record("request", route, ms, "", scale);
-            Pulse.record("status", str(status / 100) + "xx", ms, "", scale);
-            Pulse.record("latency", Pulse.bucketOf(ms), ms, "", scale);
-            if (status >= 500) { Pulse.record("failed_request", route, ms, str(status), scale); }
-            if (ms >= Pulse.slowRequestMs) { Pulse.record("slow_request", route, ms, method + " " + path); }
-            if (user != "") { Pulse.record("user", user, ms, "", scale); }
+            let statusClass = str(status / 100) + "xx";
+            let bucket = Pulse.bucketOf(ms);
+            let minute = Pulse.minuteNow();
+            let m = str(minute);
+            // (one lock for all of it, this thread's shard's)
+            let s = Pulse.shard();
+            s.lock.lock();
+            s.add("request", route, ms, "", scale, minute, m);
+            s.add("status", statusClass, ms, "", scale, minute, m);
+            s.add("latency", bucket, ms, "", scale, minute, m);
+            if (status >= 500) { s.add("failed_request", route, ms, str(status), scale, minute, m); }
+            if (ms >= Pulse.slowRequestMs) { s.add("slow_request", route, ms, method + " " + path, 1, minute, m); }
+            if (user != "") { s.add("user", user, ms, "", scale, minute, m); }
+            s.lock.unlock();
         }
         // Whether this request is counted (sampling).
         static fn sample() -> bool {
@@ -197,36 +253,7 @@ namespace apogee {
         // A path as a route: numbers, UUIDs and long hex or random-looking
         // segments become {id}, so /users/42 and /users/43 count together.
         static fn normalize(path: string) -> string {
-            let q = Str.indexOf(path, "?");
-            let p = q >= 0 ? path[..q] : path;
-            let out = new Array<string>();
-            for (seg in Str.split(p, "/")) {
-                if (seg == "") { continue; }
-                out.push(Pulse.isId(seg) ? "{id}" : seg);
-            }
-            return "/" + Str.join(out, "/");
-        }
-        private static fn isId(s: string) -> bool {
-            let digits = 0;
-            let hex = 0;
-            let letters = 0;
-            for (i in 0..s.length) {
-                let c = Str.charAt(s, i);
-                if (c >= 48 && c <= 57) {
-                    digits += 1
-                    hex += 1
-                }                              // 0-9
-                else if ((c >= 97 && c <= 102) || (c >= 65 && c <= 70)) {
-                    hex += 1
-                    letters += 1
-                }   // a-f A-F
-                else if (c == 45 || c == 95) { hex += 1; }                                       // - _
-                else if ((c >= 103 && c <= 122) || (c >= 71 && c <= 90)) { letters += 1; }
-            }
-            if (digits == s.length) { return true; }
-            if (s.length >= 16 && hex == s.length && digits > 0) { return true; }      // uuids, hashes
-            if (s.length >= 20 && digits >= 3 && digits + letters >= s.length - 2) { return true; }   // ulids, tokens
-            return false;
+            return %{ apogee_pulse_route(path) %} as string;
         }
 
         // ── watchers ───────────────────────────────────────────────────────────
@@ -436,6 +463,28 @@ namespace apogee {
                 }
             }
             return str(user);
+        }
+    }
+
+    // One shard of what Pulse has recorded and not yet written.
+    class PulseShard {
+        public buffer: HashMap<string, PulseRow> = new HashMap<string, PulseRow>()
+        public lock: Mutex = new Mutex()
+        constructor() {}
+        static fn make(n: int) -> Array<PulseShard> {
+            let out = new Array<PulseShard>();
+            for (i in 0..n) { out.push(new PulseShard()); }
+            return out;
+        }
+        // (with the lock held; `m` is the minute as text, made once per event)
+        fn add(type: string, key: string, value: double, detail: string, count: long, minute: long, m: string) {
+            let k = type + "\u{1}" + key + "\u{1}" + m;
+            let r = self.buffer.getOr(k, null);
+            if (r == null) {
+                r = new PulseRow(minute, type, key)
+                self.buffer.put(k, r)
+            }
+            r.add(count, value * (count as double), value, detail);
         }
     }
 
