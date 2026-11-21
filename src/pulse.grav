@@ -420,7 +420,9 @@ namespace apogee {
             let failure: Exception = null;
             try { res = next(req); } catch (e: Exception) { failure = e; }
             let ms = (Time.monotonicNs() - started) as double / 1000000.0;
-            Pulse.recordRequest(req.method(), path, res == null ? 500 : res.http.status, ms, Pulse.keyOfUser(req.user));
+            // (an HttpException is answered by the kernel after us, with its own status)
+            let status = res != null ? res.http.status : (failure is HttpException ? (failure as HttpException).status : 500);
+            Pulse.recordRequest(req.method(), path, status, ms, Pulse.keyOfUser(req.user));
             if (failure != null) { throw failure; }
             return res;
         }
