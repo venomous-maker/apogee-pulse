@@ -24,7 +24,12 @@ class Note extends Model {
 }
 
 class Ping extends Job { constructor() {}  fn handle() {} }
-class Broken extends Job { constructor() {}  fn handle() { throw new StateError("no luck") } }
+class Broken extends Job {
+    constructor() {}
+    fn handle() {
+        throw new StateError("no luck")
+    }
+}
 
 fn setup() -> HttpKernel {
     let file = Dir.temp() + "/pulse_test_" + str(Process.pid()) + ".sqlite"
@@ -43,7 +48,10 @@ fn setup() -> HttpKernel {
         Note.find(Integer.parseOr(str(req.route("id")), 0))
         return Response.json({"ok": true})
     })
-    r.get("/slow", fn(req: Request) -> Response { Time.sleepMs(80); return Response.json({"ok": true}) })
+    r.get("/slow", fn(req: Request) -> Response {
+        Time.sleepMs(80)
+        return Response.json({"ok": true})
+    })
     r.get("/boom", fn(req: Request) -> Response { throw new StateError("the flux capacitor broke") })
     r.get("/gone", fn(req: Request) -> Response { throw new HttpException(404) })
     let k = new HttpKernel(r)

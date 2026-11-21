@@ -19,8 +19,14 @@ namespace apogee {
         public max: double = 0.0
         // A detail kept with it (the last one recorded).
         public last: string = ""
-        constructor(minute: long, type: string, key: string) { self.minute = minute; self.type = type; self.key = key; }
-        fn average() -> double { return self.count == 0 ? 0.0 : self.sum / (self.count as double); }
+        constructor(minute: long, type: string, key: string) {
+            self.minute = minute
+            self.type = type
+            self.key = key
+        }
+        fn average() -> double {
+            return self.count == 0 ? 0.0 : self.sum / (self.count as double);
+        }
         fn add(count: long, sum: double, max: double, last: string) {
             self.count += count;
             self.sum += sum;
@@ -74,7 +80,10 @@ namespace apogee {
             for (r in rows) {
                 let k = r.type + "\u{1}" + r.key + "\u{1}" + str(r.minute);
                 let have = self.rows.getOr(k, null);
-                if (have == null) { have = new PulseRow(r.minute, r.type, r.key); self.rows.put(k, have); }
+                if (have == null) {
+                    have = new PulseRow(r.minute, r.type, r.key)
+                    self.rows.put(k, have)
+                }
                 have.add(r.count, r.sum, r.max, r.last);
             }
             self.lock.unlock();
@@ -85,7 +94,10 @@ namespace apogee {
             for ((_, r) in self.rows) {
                 if (r.type != type || r.minute < sinceMinute) { continue; }
                 let a = agg.getOr(r.key, null);
-                if (a == null) { a = new PulseRow(0, type, r.key); agg.put(r.key, a); }
+                if (a == null) {
+                    a = new PulseRow(0, type, r.key)
+                    agg.put(r.key, a)
+                }
                 a.add(r.count, r.sum, r.max, r.minute >= a.minute ? r.last : "");
                 if (r.minute > a.minute) { a.minute = r.minute; }
             }
@@ -100,7 +112,10 @@ namespace apogee {
             for ((_, r) in self.rows) {
                 if (r.type != type || r.minute < sinceMinute || (key != "" && r.key != key)) { continue; }
                 let a = byMinute.getOr(r.minute, null);
-                if (a == null) { a = new PulseRow(r.minute, type, key); byMinute.put(r.minute, a); }
+                if (a == null) {
+                    a = new PulseRow(r.minute, type, key)
+                    byMinute.put(r.minute, a)
+                }
                 a.add(r.count, r.sum, r.max, "");
             }
             self.lock.unlock();
@@ -111,7 +126,10 @@ namespace apogee {
         fn setValue(type: string, key: string, value: string) {
             self.lock.lock();
             let m = self.snapshots.getOr(type, null);
-            if (m == null) { m = new HashMap<string, string>(); self.snapshots.put(type, m); }
+            if (m == null) {
+                m = new HashMap<string, string>()
+                self.snapshots.put(type, m)
+            }
             m.put(key, value);
             self.lock.unlock();
         }
@@ -128,7 +146,12 @@ namespace apogee {
             for (k in self.rows.keys()) { if (self.rows.get(k).minute < beforeMinute) { self.rows.remove(k); } }
             self.lock.unlock();
         }
-        fn clear() { self.lock.lock(); self.rows.clear(); self.snapshots.clear(); self.lock.unlock(); }
+        fn clear() {
+            self.lock.lock()
+            self.rows.clear()
+            self.snapshots.clear()
+            self.lock.unlock()
+        }
     }
 
     // In a database (SQLite, MySQL, PostgreSQL), shared by every server and
@@ -137,8 +160,13 @@ namespace apogee {
         public prefix: string
         private pool: Pool
         private driver: string = ""
-        constructor(pool: Pool, prefix: string = "pulse_") { self.pool = pool; self.prefix = prefix; }
-        private fn t(n: string) -> string { return self.prefix + n; }
+        constructor(pool: Pool, prefix: string = "pulse_") {
+            self.pool = pool
+            self.prefix = prefix
+        }
+        private fn t(n: string) -> string {
+            return self.prefix + n;
+        }
         private fn with(f: fn(Connection)) {
             let c = self.pool.acquire();
             if (self.driver == "") { self.driver = c.driver(); }

@@ -52,10 +52,16 @@ namespace apogee {
         private static running: AtomicInt = new AtomicInt(0)
         private static sampled: AtomicInt = new AtomicInt(0)
 
-        static fn use(s: PulseStore) { Pulse.store = s; }
+        static fn use(s: PulseStore) {
+            Pulse.store = s;
+        }
         // Who may see the dashboard (default: this machine only).
-        static fn setGate(allow: fn(Request) -> bool) { Pulse.gate = allow; }
-        static fn minuteNow() -> long { return Time.nowMs() / 60000; }
+        static fn setGate(allow: fn(Request) -> bool) {
+            Pulse.gate = allow;
+        }
+        static fn minuteNow() -> long {
+            return Time.nowMs() / 60000;
+        }
 
         // ── recording ──────────────────────────────────────────────────────────
         // Adds one occurrence of `type`/`key` (with a value, as ms or anything
@@ -66,7 +72,10 @@ namespace apogee {
             let k = type + "\u{1}" + key + "\u{1}" + str(minute);
             Pulse.lock.lock();
             let r = Pulse.buffer.getOr(k, null);
-            if (r == null) { r = new PulseRow(minute, type, key); Pulse.buffer.put(k, r); }
+            if (r == null) {
+                r = new PulseRow(minute, type, key)
+                Pulse.buffer.put(k, r)
+            }
             r.add(count, value * (count as double), value, detail);
             Pulse.lock.unlock();
         }
@@ -141,19 +150,27 @@ namespace apogee {
                 let lastPrune: long = 0;
                 while (Pulse.running.get() == 1) {
                     let now = Time.nowMs();
-                    if (now - lastSample >= 15000) { Pulse.sampleServer(); lastSample = now; }
+                    if (now - lastSample >= 15000) {
+                        Pulse.sampleServer()
+                        lastSample = now
+                    }
                     Pulse.flush();
                     if (now - lastPrune >= 3600000) {
                         try { Pulse.store.prune(Pulse.minuteNow() - (Pulse.keepHours as long) * 60); } catch (e: Exception) {}
                         lastPrune = now;
                     }
                     let waited = 0;
-                    while (waited < Pulse.flushMs && Pulse.running.get() == 1) { Time.sleepMs(100); waited += 100; }
+                    while (waited < Pulse.flushMs && Pulse.running.get() == 1) {
+                        Time.sleepMs(100)
+                        waited += 100
+                    }
                 }
                 Pulse.flush();
             });
         }
-        static fn stop() { Pulse.running.set(0); }
+        static fn stop() {
+            Pulse.running.set(0);
+        }
 
         // A request: throughput per route, status classes, latency buckets,
         // slow ones, and its user.
@@ -195,8 +212,14 @@ namespace apogee {
             let letters = 0;
             for (i in 0..s.length) {
                 let c = Str.charAt(s, i);
-                if (c >= 48 && c <= 57) { digits += 1; hex += 1; }                              // 0-9
-                else if ((c >= 97 && c <= 102) || (c >= 65 && c <= 70)) { hex += 1; letters += 1; }   // a-f A-F
+                if (c >= 48 && c <= 57) {
+                    digits += 1
+                    hex += 1
+                }                              // 0-9
+                else if ((c >= 97 && c <= 102) || (c >= 65 && c <= 70)) {
+                    hex += 1
+                    letters += 1
+                }   // a-f A-F
                 else if (c == 45 || c == 95) { hex += 1; }                                       // - _
                 else if ((c >= 103 && c <= 122) || (c >= 71 && c <= 90)) { letters += 1; }
             }
@@ -250,7 +273,10 @@ namespace apogee {
             // totals and latency
             let total: long = 0;
             let failed: long = 0;
-            for (r in s.top("status", since, "count", 10)) { total += r.count; if (r.key == "5xx") { failed += r.count; } }
+            for (r in s.top("status", since, "count", 10)) {
+                total += r.count
+                if (r.key == "5xx") { failed += r.count; }
+            }
             o.set("requests", total);
             o.set("failedRequests", failed);
             let lat = s.top("latency", since, "count", 100);
@@ -329,10 +355,13 @@ namespace apogee {
         // One point per bucket of the period (at most 60), zeros where nothing happened.
         private static fn seriesJson(rows: Array<PulseRow>, since: long, minutes: long) -> JsonValue {
             let step = minutes <= 60 ? 1 as long : minutes / 60;
-            let n = (minutes + step - 1) / step;
+            let n = (minutes + step -1) / step;
             let counts = new Array<long>();
             let maxes = new Array<double>();
-            for (i in 0..n) { counts.push(0); maxes.push(0.0); }
+            for (i in 0..n) {
+                counts.push(0)
+                maxes.push(0.0)
+            }
             for (r in rows) {
                 let i = (r.minute - since) / step;
                 if (i < 0 || i >= n) { continue; }
@@ -380,7 +409,9 @@ namespace apogee {
                 }
             }
         }
-        static fn isDashboardPath(path: string) -> bool { return Str.startsWith(path, Pulse.base); }
+        static fn isDashboardPath(path: string) -> bool {
+            return Str.startsWith(path, Pulse.base);
+        }
         private static fn guard(h: fn(Request) -> Response) -> fn(Request) -> Response {
             return fn(req: Request) -> Response {
                 let g = Pulse.gate;
