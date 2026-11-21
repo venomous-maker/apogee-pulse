@@ -1,0 +1,246 @@
+// store.grav — what Pulse keeps: per-minute aggregates (how many, their sum,
+// the largest, the last detail) of each type and key, and the latest value of
+// things that are snapshots (each server's memory and load). Recording only
+// adds to an in-memory buffer; the buffer goes to the store in one batch every
+// few seconds, so watching a busy app costs almost nothing per request.
+import "std"
+import "grav-db"
+use db.*
+
+namespace apogee {
+
+    // One type and key over one minute (or, from a query, over a period).
+    class PulseRow {
+        public minute: long
+        public type: string
+        public key: string
+        public count: long = 0
+        public sum: double = 0.0
+        public max: double = 0.0
+        // A detail kept with it (the last one recorded).
+        public last: string = ""
+        constructor(minute: long, type: string, key: string) { self.minute = minute; self.type = type; self.key = key; }
+        fn average() -> double { return self.count == 0 ? 0.0 : self.sum / (self.count as double); }
+        fn add(count: long, sum: double, max: double, last: string) {
+            self.count += count;
+            self.sum += sum;
+            if (max > self.max) { self.max = max; }
+            if (last != "") { self.last = last; }
+        }
+    }
+
+    interface PulseStore {
+        // Adds rows to what is stored (counts and sums add up; maxima keep the larger).
+        fn addMany(rows: Array<PulseRow>)
+        // The keys of `type` since `sinceMinute`, aggregated, ordered by `by`
+        // ("count", "max", "sum" or "average"), the first `limit`.
+        fn top(type: string, sinceMinute: long, by: string, limit: int) -> Array<PulseRow>
+        // `type` (all keys together, or one key when given) minute by minute.
+        fn series(type: string, key: string, sinceMinute: long) -> Array<PulseRow>
+        // Snapshots: the latest value per key.
+        fn setValue(type: string, key: string, value: string)
+        fn values(type: string) -> HashMap<string, string>
+        // Drops minutes before `minute`.
+        fn prune(beforeMinute: long)
+        fn clear()
+    }
+
+    // Sorting rows by a measure.
+    class PulseOrder {
+        static fn sort(rows: Array<PulseRow>, by: string) {
+            rows.sortBy(fn(a: PulseRow, b: PulseRow) -> int {
+                let x = PulseOrder.measure(a, by);
+                let y = PulseOrder.measure(b, by);
+                return x > y ? -1 : (x < y ? 1 : Str.compare(a.key, b.key));
+            });
+        }
+        static fn measure(r: PulseRow, by: string) -> double {
+            switch (by) {
+                case "max": return r.max
+                case "sum": return r.sum
+                case "average": return r.average()
+                default: return r.count as double
+            }
+        }
+    }
+
+    // In this process's memory (one process; development, tests). Thread-safe.
+    class MemoryPulseStore implements PulseStore {
+        private rows: HashMap<string, PulseRow> = new HashMap<string, PulseRow>()
+        private snapshots: HashMap<string, HashMap<string, string>> = new HashMap<string, HashMap<string, string>>()
+        private lock: Mutex = new Mutex()
+        fn addMany(rows: Array<PulseRow>) {
+            self.lock.lock();
+            for (r in rows) {
+                let k = r.type + "\u{1}" + r.key + "\u{1}" + str(r.minute);
+                let have = self.rows.getOr(k, null);
+                if (have == null) { have = new PulseRow(r.minute, r.type, r.key); self.rows.put(k, have); }
+                have.add(r.count, r.sum, r.max, r.last);
+            }
+            self.lock.unlock();
+        }
+        fn top(type: string, sinceMinute: long, by: string, limit: int) -> Array<PulseRow> {
+            let agg = new HashMap<string, PulseRow>();
+            self.lock.lock();
+            for ((_, r) in self.rows) {
+                if (r.type != type || r.minute < sinceMinute) { continue; }
+                let a = agg.getOr(r.key, null);
+                if (a == null) { a = new PulseRow(0, type, r.key); agg.put(r.key, a); }
+                a.add(r.count, r.sum, r.max, r.minute >= a.minute ? r.last : "");
+                if (r.minute > a.minute) { a.minute = r.minute; }
+            }
+            self.lock.unlock();
+            let out = agg.values();
+            PulseOrder.sort(out, by);
+            return out.size() > limit ? out.slice(0, limit) : out;
+        }
+        fn series(type: string, key: string, sinceMinute: long) -> Array<PulseRow> {
+            let byMinute = new HashMap<long, PulseRow>();
+            self.lock.lock();
+            for ((_, r) in self.rows) {
+                if (r.type != type || r.minute < sinceMinute || (key != "" && r.key != key)) { continue; }
+                let a = byMinute.getOr(r.minute, null);
+                if (a == null) { a = new PulseRow(r.minute, type, key); byMinute.put(r.minute, a); }
+                a.add(r.count, r.sum, r.max, "");
+            }
+            self.lock.unlock();
+            let out = byMinute.values();
+            out.sortBy(fn(a: PulseRow, b: PulseRow) -> int { return a.minute < b.minute ? -1 : (a.minute > b.minute ? 1 : 0); });
+            return out;
+        }
+        fn setValue(type: string, key: string, value: string) {
+            self.lock.lock();
+            let m = self.snapshots.getOr(type, null);
+            if (m == null) { m = new HashMap<string, string>(); self.snapshots.put(type, m); }
+            m.put(key, value);
+            self.lock.unlock();
+        }
+        fn values(type: string) -> HashMap<string, string> {
+            let out = new HashMap<string, string>();
+            self.lock.lock();
+            let m = self.snapshots.getOr(type, null);
+            if (m != null) { for ((k, v) in m) { out.put(k, v); } }
+            self.lock.unlock();
+            return out;
+        }
+        fn prune(beforeMinute: long) {
+            self.lock.lock();
+            for (k in self.rows.keys()) { if (self.rows.get(k).minute < beforeMinute) { self.rows.remove(k); } }
+            self.lock.unlock();
+        }
+        fn clear() { self.lock.lock(); self.rows.clear(); self.snapshots.clear(); self.lock.unlock(); }
+    }
+
+    // In a database (SQLite, MySQL, PostgreSQL), shared by every server and
+    // process. One upsert per row of a batch, in one transaction.
+    class DatabasePulseStore implements PulseStore {
+        public prefix: string
+        private pool: Pool
+        private driver: string = ""
+        constructor(pool: Pool, prefix: string = "pulse_") { self.pool = pool; self.prefix = prefix; }
+        private fn t(n: string) -> string { return self.prefix + n; }
+        private fn with(f: fn(Connection)) {
+            let c = self.pool.acquire();
+            if (self.driver == "") { self.driver = c.driver(); }
+            try { f(c); } finally { self.pool.release(c); }
+        }
+        fn createTables() {
+            self.with(fn(c: Connection) {
+                let text = c.driver() == "mysql" ? "LONGTEXT" : "TEXT";
+                let dbl = c.driver() == "postgres" ? "DOUBLE PRECISION" : "DOUBLE";
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("aggregates") + " (minute BIGINT NOT NULL, type VARCHAR(32) NOT NULL, key_hash VARCHAR(64) NOT NULL, " +
+                       "pkey " + text + " NOT NULL, count BIGINT NOT NULL, total " + dbl + " NOT NULL, maximum " + dbl + " NOT NULL, last " + text + " NOT NULL, " +
+                       "PRIMARY KEY (minute, type, key_hash))");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("values") + " (type VARCHAR(32) NOT NULL, key_hash VARCHAR(64) NOT NULL, pkey " + text +
+                       " NOT NULL, value " + text + " NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY (type, key_hash))");
+                if (c.driver() != "mysql") {
+                    c.exec("CREATE INDEX IF NOT EXISTS " + self.t("aggregates") + "_type_minute ON " + self.t("aggregates") + " (type, minute)");
+                }
+            });
+        }
+        private fn upsert() -> string {
+            let a = self.t("aggregates");
+            let base = "INSERT INTO " + a + " (minute, type, key_hash, pkey, count, total, maximum, last) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+            if (self.driver == "mysql") {
+                return base + " ON DUPLICATE KEY UPDATE count = count + VALUES(count), total = total + VALUES(total), " +
+                       "maximum = GREATEST(maximum, VALUES(maximum)), last = IF(VALUES(last) = '', last, VALUES(last))";
+            }
+            let maxFn = self.driver == "sqlite" ? "MAX" : "GREATEST";
+            return base + " ON CONFLICT (minute, type, key_hash) DO UPDATE SET count = " + a + ".count + excluded.count, total = " + a + ".total + excluded.total, " +
+                   "maximum = " + maxFn + "(" + a + ".maximum, excluded.maximum), last = CASE WHEN excluded.last = '' THEN " + a + ".last ELSE excluded.last END";
+        }
+        fn addMany(rows: Array<PulseRow>) {
+            if (rows.size() == 0) { return; }
+            self.with(fn(c: Connection) {
+                let sql = self.upsert();
+                c.transaction(fn() {
+                    for (r in rows) {
+                        c.execute(sql, [r.minute, r.type, Hash.sha256(r.key)[..40], r.key, r.count, r.sum, r.max, r.last]);
+                    }
+                });
+            });
+        }
+        private static fn rowOf(r: Row, minute: long, type: string) -> PulseRow {
+            let p = new PulseRow(minute, type, r.getString("pkey"));
+            p.count = Integer.parseOr(str(r.get("n")), 0);
+            p.sum = Float.parseOr(str(r.get("s")), 0.0);
+            p.max = Float.parseOr(str(r.get("m")), 0.0);
+            p.last = r.has("l") && r.get("l") != null ? r.getString("l") : "";
+            return p;
+        }
+        fn top(type: string, sinceMinute: long, by: string, limit: int) -> Array<PulseRow> {
+            let order = by == "max" ? "MAX(maximum)" : (by == "sum" ? "SUM(total)" : (by == "average" ? "SUM(total) / SUM(count)" : "SUM(count)"));
+            let out = new Array<PulseRow>();
+            self.with(fn(c: Connection) {
+                for (r in c.query("SELECT pkey, SUM(count) AS n, SUM(total) AS s, MAX(maximum) AS m, MAX(last) AS l FROM " + self.t("aggregates") +
+                                  " WHERE type = ? AND minute >= ? GROUP BY key_hash, pkey ORDER BY " + order + " DESC, pkey LIMIT " + str(limit), [type, sinceMinute])) {
+                    out.push(DatabasePulseStore.rowOf(r, 0, type));
+                }
+            });
+            return out;
+        }
+        fn series(type: string, key: string, sinceMinute: long) -> Array<PulseRow> {
+            let out = new Array<PulseRow>();
+            self.with(fn(c: Connection) {
+                let sql = "SELECT minute, '' AS pkey, SUM(count) AS n, SUM(total) AS s, MAX(maximum) AS m FROM " + self.t("aggregates") +
+                          " WHERE type = ? AND minute >= ?" + (key != "" ? " AND key_hash = ?" : "") + " GROUP BY minute ORDER BY minute";
+                let args = new Array<any>();
+                args.push(type); args.push(sinceMinute);
+                if (key != "") { args.push(Hash.sha256(key)[..40]); }
+                for (r in c.query(sql, args)) {
+                    let p = DatabasePulseStore.rowOf(r, Integer.parseOr(str(r.get("minute")), 0), type);
+                    p.key = key;
+                    out.push(p);
+                }
+            });
+            return out;
+        }
+        fn setValue(type: string, key: string, value: string) {
+            self.with(fn(c: Connection) {
+                let h = Hash.sha256(key)[..40];
+                c.transaction(fn() {
+                    let n = c.execute("UPDATE " + self.t("values") + " SET value = ?, updated_at = ? WHERE type = ? AND key_hash = ?", [value, Time.nowMs(), type, h]);
+                    if (n == 0) {
+                        c.execute("INSERT INTO " + self.t("values") + " (type, key_hash, pkey, value, updated_at) VALUES (?, ?, ?, ?, ?)", [type, h, key, value, Time.nowMs()]);
+                    }
+                });
+            });
+        }
+        fn values(type: string) -> HashMap<string, string> {
+            let out = new HashMap<string, string>();
+            self.with(fn(c: Connection) {
+                for (r in c.query("SELECT pkey, value FROM " + self.t("values") + " WHERE type = ?", [type])) { out.put(r.getString("pkey"), r.getString("value")); }
+            });
+            return out;
+        }
+        fn prune(beforeMinute: long) {
+            self.with(fn(c: Connection) { c.execute("DELETE FROM " + self.t("aggregates") + " WHERE minute < ?", [beforeMinute]); });
+        }
+        fn clear() {
+            self.with(fn(c: Connection) {
+                c.execute("DELETE FROM " + self.t("aggregates"));
+                c.execute("DELETE FROM " + self.t("values"));
+            });
+        }
+    }
+}
