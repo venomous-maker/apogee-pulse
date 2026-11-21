@@ -4,7 +4,6 @@
 // database store (adding up across flushes); the server sample; the page, its
 // API and the gate.
 import "std"
-import "std/net"
 import "apogee-container"
 import "apogee-events"
 import "apogee-http"

@@ -198,7 +198,7 @@ namespace apogee {
                    "maximum = " + maxFn + "(" + a + ".maximum, excluded.maximum), last = CASE WHEN excluded.last = '' THEN " + a + ".last ELSE excluded.last END";
         }
         fn addMany(rows: Array<PulseRow>) {
-            if (rows.size() == 0) { return; }
+            if (rows.isEmpty()) { return; }
             self.with(fn(c: Connection) {
                 let sql = self.upsert();
                 c.transaction(fn() {
