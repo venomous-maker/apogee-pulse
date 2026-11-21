@@ -45,6 +45,7 @@ fn setup() -> HttpKernel {
     })
     r.get("/slow", fn(req: Request) -> Response { Time.sleepMs(80); return Response.json({"ok": true}) })
     r.get("/boom", fn(req: Request) -> Response { throw new StateError("the flux capacitor broke") })
+    r.get("/gone", fn(req: Request) -> Response { throw new HttpException(404) })
     let k = new HttpKernel(r)
     Pulse.watchExceptions(k)
     Pulse.routes(r)
@@ -61,6 +62,7 @@ test "routes, statuses, latency, slow requests, queries and exceptions" {
     for (i in 0..20) { c.getJson("/notes/" + str(i)).assertOk() }
     c.getJson("/slow").assertOk()
     c.getJson("/boom").assertServerError()
+    c.getJson("/gone").assertNotFound()                     // a 4xx, not a failure
     Pulse.flush()
     let since = Pulse.minuteNow() - 5
     let routes = Pulse.store.top("request", since, "count", 10)
@@ -69,6 +71,7 @@ test "routes, statuses, latency, slow requests, queries and exceptions" {
     assert(find(routes, "GET /slow").max >= 80.0)
     assertEq(find(Pulse.store.top("status", since, "count", 10), "2xx").count, 21 as long)
     assertEq(find(Pulse.store.top("status", since, "count", 10), "5xx").count, 1 as long)
+    assertEq(find(Pulse.store.top("status", since, "count", 10), "4xx").count, 1 as long)
     let slow = Pulse.store.top("slow_request", since, "max", 10)
     assertEq(slow.size(), 1)
     assertEq(slow[0].last, "GET /slow")
