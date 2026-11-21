@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.2 (2026-11-21)
+
 - Cheaper recording: one lock per request, buffers sharded by thread (four
   threads recording at once no longer wait on each other), and routes found in
   one pass (about 4 times faster).
