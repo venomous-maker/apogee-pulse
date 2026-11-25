@@ -16,7 +16,7 @@ import "std"
 import "apogee-pulse"
 use apogee.*
 
-Pulse.use(new DatabasePulseStore(pool))      // then .createTables(); or the memory store (the default)
+Pulse.use(new DatabasePulseStore(pool))      // then .createTables() (in an app: the migration); or the memory store (the default)
 Pulse.watchQueries()                         // slow queries (Orbit's DB.listen)
 Pulse.watchExceptions(kernel)                // what the HTTP kernel reports
 Pulse.watchJobs(events)                      // the queue's events
@@ -28,6 +28,28 @@ Pulse.start()                                // flush every 5 s, sample this ser
 
 Pulse.record("checkout", "card", 182.0)      // anything else worth counting
 ```
+
+## In an apogee-framework app
+
+Importing the module is all it takes: `PulsePackage` (apogee-package) connects it when
+the app is created. When `pulse.enabled`, per-minute production metrics are recorded (requests, slow requests, queries and jobs, exceptions, servers) and shown at `/pulse`. The page is open locally; elsewhere only to a signed-in user the gate allows `viewPulse`. Metrics are written from a background thread through the app's pool.
+
+**Migration:** `CreatePulseTables` makes `pulse_aggregates` and `pulse_values`. Run `migrate` after adding the module.
+
+**Commands:** `pulse:clear`.
+
+| Setting | Default |
+|---|---|
+| `pulse.enabled` | `PULSE_ENABLED`, off |
+| `pulse.driver` | `PULSE_DRIVER`: `database` (default) or `memory` |
+| `pulse.path` | `PULSE_PATH`, `pulse` |
+| `pulse.server` | `PULSE_SERVER_NAME`: this machine's name in the servers card |
+| `pulse.sample_rate` | `PULSE_SAMPLE_RATE`, 1 |
+| `pulse.keep_hours` | `PULSE_KEEP_HOURS`, 168 |
+| `pulse.slow_request_ms`, `.slow_query_ms`, `.slow_job_ms` | 1000 each (`PULSE_SLOW_*_MS`) |
+| `pulse.ignore_paths` | `PULSE_IGNORE_PATHS`, comma-separated |
+
+Your own configuration wins over these defaults.
 
 ## What it records
 
@@ -77,6 +99,7 @@ The page and its API (`/pulse/api/overview?period=1h|6h|24h|7d`,
 
 ```sh
 grav test tests/pulse.grav
+grav test tests/package.grav
 PULSE_MYSQL_URL=mysql://root:pw@127.0.0.1:3306/pulse PULSE_POSTGRES_URL=postgres://postgres:pw@127.0.0.1:5432/pulse grav test tests/pulse.grav
 ```
 
