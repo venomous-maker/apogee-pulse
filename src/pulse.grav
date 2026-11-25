@@ -77,8 +77,13 @@ namespace apogee {
         // How often the buffer is written out and the server sampled (ms), and how long minutes are kept (hours).
         static flushMs: int = 5000
         static keepHours: int = 168
-        // The latency buckets (ms): a request counts in the first it fits under.
+        // The latency buckets (ms) with preciseLatency off: a request counts in the
+        // first it fits under.
         static buckets: Array<double> = [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0]
+        // Fine latency buckets (the default): each 2^(1/8) (about 9%) wider than the
+        // last, from 0.05 ms to two minutes (about 170), so percentiles come out
+        // within a few percent instead of at the next coarse bound.
+        static preciseLatency: bool = true
         // The name this server reports as.
         static server: string = OS.hostname()
         private static gate: fn(Request) -> bool = null
@@ -159,7 +164,7 @@ namespace apogee {
             o.set("load5", load[1]);
             o.set("load15", load[2]);
             o.set("at", Time.nowMs());
-            try { Pulse.store.setValue("server", Pulse.server, o.toJson()); } catch (e: Exception) {}
+            try { Pulse.store.setValue("server", Pulse.server, o.toJson()); } catch (e: Exception) {}   // (a sample missed: the next one comes in a minute)
             // and a series of this server's load and memory, for the charts
             Pulse.record("server_load", Pulse.server, load[0]);
             Pulse.record("server_memory", Pulse.server, ((mem[0] - mem[1]) / 1048576) as double);
@@ -202,7 +207,7 @@ namespace apogee {
                     }
                     Pulse.flush();
                     if (now - lastPrune >= 3600000) {
-                        try { Pulse.store.prune(Pulse.minuteNow() - (Pulse.keepHours as long) * 60); } catch (e: Exception) {}
+                        try { Pulse.store.prune(Pulse.minuteNow() - (Pulse.keepHours as long) * 60); } catch (e: Exception) {}   // (pruned again in an hour)
                         lastPrune = now;
                     }
                     let waited = 0;
@@ -219,11 +224,12 @@ namespace apogee {
         }
 
         // A request: throughput per route, status classes, latency buckets,
-        // slow ones, and its user.
-        static fn recordRequest(method: string, path: string, status: int, ms: double, user: string) {
+        // slow ones, and its user. `pattern` is the matched route's ("/users/{id}"),
+        // or "" to make one from the path.
+        static fn recordRequest(method: string, path: string, status: int, ms: double, user: string, pattern: string = "") {
             if (!Pulse.recording) { return; }
             let scale = Pulse.sampleRate >= 1.0 ? 1 as long : (1.0 / Pulse.sampleRate) as long;
-            let route = method + " " + Pulse.normalize(path);
+            let route = method + " " + (pattern != "" ? pattern : Pulse.normalize(path));
             let statusClass = str(status / 100) + "xx";
             let bucket = Pulse.bucketOf(ms);
             let minute = Pulse.minuteNow();
@@ -246,8 +252,24 @@ namespace apogee {
             return every <= 1 || Pulse.sampled.increment() % every == 0;
         }
         static fn bucketOf(ms: double) -> string {
+            if (Pulse.preciseLatency) {
+                // ("q<i>": bucket i is up to 0.05 ms * 2^(i/8))
+                if (ms <= 0.05) { return "q0"; }
+                let i = Math.ceil(Math.log2(ms / 0.05) * 8.0) as long;
+                return "q" + str(i > 200 ? 200 as long : i);
+            }
             for (b in Pulse.buckets) { if (ms <= b) { return str(b as long); } }
             return "inf";
+        }
+        // A bucket's range in ms (lower, upper), for either kind of key.
+        static fn bucketRange(key: string, coarseBefore: double) -> Array<double> {
+            if (Str.startsWith(key, "q")) {
+                let i = Format.toLongOr(key[1..], 0) as double;
+                let upper = 0.05 * Math.pow(2.0, i / 8.0);
+                return [i == 0.0 ? 0.0 : upper / Math.pow(2.0, 0.125), upper];
+            }
+            if (key == "inf") { return [coarseBefore, 1.0e18]; }
+            return [coarseBefore, Float.parseOr(key, 0.0)];
         }
         // A path as a route: numbers, UUIDs and long hex or random-looking
         // segments become {id}, so /users/42 and /users/43 count together.
@@ -305,10 +327,10 @@ namespace apogee {
             }
             o.set("requests", total);
             o.set("failedRequests", failed);
-            let lat = s.top("latency", since, "count", 100);
-            o.set("p50", Pulse.percentile(lat, 0.50));
-            o.set("p95", Pulse.percentile(lat, 0.95));
-            o.set("p99", Pulse.percentile(lat, 0.99));
+            let lat = s.top("latency", since, "count", 400);
+            for (p in [["p50", "0.5"], ["p75", "0.75"], ["p90", "0.9"], ["p95", "0.95"], ["p99", "0.99"], ["p999", "0.999"]]) {
+                o.set(p[0], Math.round(Pulse.percentile(lat, Format.toFloat(p[1])) * 100.0) / 100.0);
+            }
             o.set("throughput", Pulse.seriesJson(s.series("request", "", since), since, minutes));
             o.set("statuses", Pulse.rowsJson(s.top("status", since, "count", 10)));
             o.set("routes", Pulse.rowsJson(s.top("request", since, "count", 15)));
@@ -346,24 +368,34 @@ namespace apogee {
             o.set("servers", servers);
             return o;
         }
-        // The bucket a share of requests is under (an upper bound, in ms).
+        // The latency (ms) a share `p` of requests is under: found in its bucket,
+        // placed within it by how far into the bucket's requests it falls, and
+        // never above the slowest request the bucket saw.
         static fn percentile(buckets: Array<PulseRow>, p: double) -> double {
             let total: long = 0;
             for (b in buckets) { total += b.count; }
             if (total == 0) { return 0.0; }
             let sorted = buckets.copy();
             sorted.sortBy(fn(a: PulseRow, b: PulseRow) -> int {
-                let x = a.key == "inf" ? 1.0e18 : Float.parseOr(a.key, 0.0);
-                let y = b.key == "inf" ? 1.0e18 : Float.parseOr(b.key, 0.0);
+                let x = Pulse.bucketRange(a.key, 0.0)[1];
+                let y = Pulse.bucketRange(b.key, 0.0)[1];
                 return x < y ? -1 : (x > y ? 1 : 0);
             });
             let want = (total as double) * p;
             let seen: long = 0;
+            let coarseBefore = 0.0;
             for (b in sorted) {
+                let range = Pulse.bucketRange(b.key, coarseBefore);
+                if (!Str.startsWith(b.key, "q")) { coarseBefore = range[1]; }
+                if ((seen + b.count) as double >= want) {
+                    let into = b.count > 0 ? (want - (seen as double)) / (b.count as double) : 1.0;
+                    let upper = range[1] > b.max && b.max > 0 ? b.max : range[1];
+                    let lower = range[0] < upper ? range[0] : upper;
+                    return lower + (upper - lower) * (into < 0 ? 0.0 : (into > 1 ? 1.0 : into));
+                }
                 seen += b.count;
-                if ((seen as double) >= want) { return b.key == "inf" ? b.max : Float.parseOr(b.key, 0.0); }
             }
-            return 0.0;
+            return sorted[sorted.size() - 1].max;
         }
         private static fn rowsJson(rows: Array<PulseRow>) -> JsonValue {
             let a = Json.array();
@@ -501,7 +533,7 @@ namespace apogee {
             let ms = (Time.monotonicNs() - started) as double / 1000000.0;
             // (an HttpException is answered by the kernel after us, with its own status)
             let status = res != null ? res.http.status : (failure is HttpException ? (failure as HttpException).status : 500);
-            Pulse.recordRequest(req.method(), path, status, ms, Pulse.keyOfUser(req.user));
+            Pulse.recordRequest(req.method(), path, status, ms, Pulse.keyOfUser(req.user), req.routeUri());
             if (failure != null) { throw failure; }
             return res;
         }

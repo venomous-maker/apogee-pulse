@@ -85,9 +85,11 @@ function render(d) {
   let h = `<section class="wide"><div class="stats">
     <div class="stat"><b>${num(d.requests)}</b><small>requests</small></div>
     <div class="stat"><b class="${failRate > 1 ? "bad" : "ok"}">${failRate.toFixed(2)}%</b><small>failed (5xx)</small></div>
-    <div class="stat"><b>${ms(d.p50)}</b><small>p50 (bucket)</small></div>
+    <div class="stat"><b>${ms(d.p50)}</b><small>p50</small></div>
+    <div class="stat"><b>${ms(d.p90)}</b><small>p90</small></div>
     <div class="stat"><b class="${d.p95 > 1000 ? "warn" : ""}">${ms(d.p95)}</b><small>p95</small></div>
     <div class="stat"><b class="${d.p99 > 2500 ? "bad" : ""}">${ms(d.p99)}</b><small>p99</small></div>
+    <div class="stat"><b class="${d.p999 > 5000 ? "bad" : ""}">${ms(d.p999)}</b><small>p99.9</small></div>
     <div class="stat"><b>${num(d.exceptions.reduce((a, e) => a + e.count, 0))}</b><small>exceptions</small></div>
     <div class="stat"><b>${num(d.jobs.reduce((a, e) => a + e.count, 0))}</b><small>jobs done</small></div>
   </div></section>`;
