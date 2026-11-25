@@ -1,0 +1,62 @@
+// PulsePackage: off unless enabled; its tables from the migration, and the page.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "apogee-events"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-queue"
+import "apogee-testing"
+import "grav-db"
+import "grav-orbit"
+import "../src/all.grav"
+use apogee.*
+use db.*
+use orbit.*
+
+// What the framework binds, for a package to boot against.
+fn appContainer() -> Container {
+    let c = new Container()
+    c.instance::<Events>(new Events(c))
+    let r = new Router(c)
+    c.instance::<Router>(r)
+    c.instance::<HttpKernel>(new HttpKernel(r))
+    c.instance::<QueueManager>(new QueueManager(c))
+    r.aliasMiddleware("session", fn(a: Array<string>) -> Middleware { return new SameOriginOnly() })
+    return c
+}
+
+test "the package connects itself" {
+    let file = Dir.temp() + "/pulse_pkg_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    let ps = Packages.discover()
+    assertEq(ps[0].name(), "pulse")
+    Packages.applyDefaults(ps)
+    for (m in ps[0].migrations()) { (m as Migration).up() }
+    assert(Schema.hasTable("pulse_aggregates") && Schema.hasTable("pulse_values"))
+    let c = appContainer()
+    ps[0].boot(new PackageContext(c, "local", ""))
+    assert(!Pulse.recording)
+    Config.set("pulse.enabled", true)
+    Config.set("pulse.driver", "memory")
+    ps[0].boot(new PackageContext(c, "local", ""))
+    assert(Pulse.recording)
+    new TestClient(c.make::<HttpKernel>()).get("/pulse").assertOk()
+    Pulse.stop()
+    new File(file).delete()
+}
+
+// With PULSE_MYSQL_URL / PULSE_POSTGRES_URL set (mysql://… / postgres://…).
+test "the migration on MySQL and PostgreSQL" {
+    for (url in [env("PULSE_MYSQL_URL"), env("PULSE_POSTGRES_URL")]) {
+        if (url == "") { continue }
+        DB.connect(Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection)
+        for (m in Packages.discover()[0].migrations()) { (m as Migration).down() }
+        for (m in Packages.discover()[0].migrations()) { (m as Migration).up() }
+        assert(Schema.hasTable("pulse_aggregates"))
+        for (m in Packages.discover()[0].migrations()) { (m as Migration).down() }
+        assert(!Schema.hasTable("pulse_aggregates"))
+    }
+}
