@@ -1,0 +1,74 @@
+// package.grav — how apogee-pulse connects itself to an app (apogee-package):
+// pulse.enabled records per-minute production metrics, shown at /pulse; its
+// tables (CreatePulseTables); pulse:clear.
+import "std"
+import "apogee-config"
+import "apogee-package"
+import "apogee-events"
+import "apogee-routing"
+import "apogee-console"
+import "grav-db"
+import "store.grav"
+import "pulse.grav"
+import "migration.grav"
+use db.*
+
+namespace apogee {
+
+    class PulsePackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "pulse"; }
+        // (always connected: when off it only makes sure nothing is recorded)
+        fn enabled() -> bool { return true; }
+        fn defaults() -> HashMap<string, any> {
+            return {"pulse.enabled": Env.getBool("PULSE_ENABLED", false), "pulse.driver": Env.get("PULSE_DRIVER", "database"),
+                    "pulse.path": Env.get("PULSE_PATH", "pulse"), "pulse.server": Env.get("PULSE_SERVER_NAME", ""),
+                    "pulse.sample_rate": Env.get("PULSE_SAMPLE_RATE", "1"), "pulse.keep_hours": Env.getInt("PULSE_KEEP_HOURS", 168),
+                    "pulse.slow_request_ms": Env.getInt("PULSE_SLOW_REQUEST_MS", 1000),
+                    "pulse.slow_query_ms": Env.getInt("PULSE_SLOW_QUERY_MS", 1000),
+                    "pulse.slow_job_ms": Env.getInt("PULSE_SLOW_JOB_MS", 1000),
+                    "pulse.ignore_paths": Env.get("PULSE_IGNORE_PATHS", "")};
+        }
+        fn migrations() -> Array<any> { return [new CreatePulseTables() as any]; }
+        fn commands() -> Array<any> { return [new PulseClearCommand() as any]; }
+        fn boot(app: PackageContext) {
+            if (!Config.getBool("pulse.enabled", false)) {
+                Pulse.recording = false
+                return
+            }
+            // (its own pool: it writes from a background thread, and retries a flush that meets a lock)
+            Pulse.use(Config.getString("pulse.driver", "database") == "database"
+                ? new DatabasePulseStore(app.make::<Pool>()) as PulseStore : new MemoryPulseStore() as PulseStore);
+            Pulse.recording = true;
+            Pulse.slowRequestMs = Config.getInt("pulse.slow_request_ms", 1000) as double;
+            Pulse.slowQueryMs = Config.getInt("pulse.slow_query_ms", 1000) as double;
+            Pulse.slowJobMs = Config.getInt("pulse.slow_job_ms", 1000) as double;
+            Pulse.sampleRate = Float.parseOr(Config.getString("pulse.sample_rate", "1"), 1.0);
+            Pulse.keepHours = Config.getInt("pulse.keep_hours", 168) as int;
+            Pulse.ignorePaths = PackageContext.list(Config.getString("pulse.ignore_paths"));
+            let server = Config.getString("pulse.server");
+            if (server != "") { Pulse.server = server; }
+            Pulse.watchQueries();
+            Pulse.watchExceptions(app.make::<HttpKernel>());
+            Pulse.watchJobs(app.make::<Events>());
+            Pulse.setGate(app.dashboardGate("viewPulse"));
+            let r = app.make::<Router>();
+            r.aliasInstance("pulse", new PulseMiddleware());
+            r.use("pulse");
+            let path = Config.getString("pulse.path", "pulse");
+            app.dashboardRoutes(fn(g: Router) { Pulse.routes(g, path); });
+            Pulse.start();
+        }
+    }
+
+    class PulseClearCommand extends ConsoleCommand {
+        constructor() {}
+        fn signature() -> string { return "pulse:clear"; }
+        fn description() -> string { return "Remove every Pulse metric"; }
+        fn handle() -> int {
+            Pulse.store.clear()
+            self.output.writeln("<info>Pulse metrics cleared.</>")
+            return 0
+        }
+    }
+}
