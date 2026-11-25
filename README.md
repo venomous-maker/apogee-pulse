@@ -11,7 +11,7 @@ largest, the last detail) of each kind and key. Recording adds to an
 in-memory buffer; a background thread writes the buffer out in one batch every
 few seconds, so it is cheap enough to leave on in production.
 
-```grav
+```typescript
 import "std"
 import "apogee-pulse"
 use apogee.*
@@ -81,7 +81,7 @@ Percentiles come from the latency buckets (each is the bucket's upper bound).
 
 ## Settings
 
-```grav
+```typescript
 Pulse.slowRequestMs = 1000.0                  // also slowQueryMs, slowJobMs
 Pulse.sampleRate = 0.1                        // count one request in ten (scaled back up)
 Pulse.ignorePaths.push("/health")
