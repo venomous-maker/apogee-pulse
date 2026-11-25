@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.2.0 (2026-11-25)
+
 Needs grav 1.12.0 or newer.
 
 - Finer percentiles: about 170 latency buckets (each about 9% wider than the
