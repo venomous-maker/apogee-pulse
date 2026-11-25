@@ -98,8 +98,10 @@ test "paths become routes" {
     assertEq(Pulse.normalize("/files/01HZX3K9Q8W2V7N5M4B6C1D0EF"), "/files/{id}")
     assertEq(Pulse.normalize("/blog/hello-world"), "/blog/hello-world")
     assertEq(Pulse.normalize("/"), "/")
+    Pulse.preciseLatency = false                                       // (the coarse buckets)
     assertEq(Pulse.bucketOf(3.0), "5")
     assertEq(Pulse.bucketOf(99999.0), "inf")
+    Pulse.preciseLatency = true
 }
 
 test "jobs" {
@@ -202,4 +204,30 @@ test "the page, its API, and the gate" {
     c.getJson("/pulse/api/overview").assertJsonPath("requests", 0)
     c.remote = "203.0.113.5:9999"
     c.getJson("/pulse/api/overview").assertForbidden()
+}
+
+test "percentiles: fine buckets, placed within them; the matched route's pattern" {
+    Pulse.use(new MemoryPulseStore())
+    Pulse.recording = true
+    Pulse.sampleRate = 1.0
+    for (i in 1..=2000) { Pulse.recordRequest("GET", "/items/${i}", 200, (i as double) / 2.0, "", "/items/{id}") }
+    Pulse.flush()
+    let o = Pulse.overview(5)
+    let near = fn(key: string, want: double) {
+        let got = o.get(key).asFloat()
+        assert(Math.abs(got - want) <= want * 0.05 + 0.5, "${key}: ${got}, want about ${want}")
+    }
+    near("p50", 500.0)
+    near("p75", 750.0)
+    near("p90", 900.0)
+    near("p95", 950.0)
+    near("p99", 990.0)
+    near("p999", 999.0)
+    assert(o.get("p999").asFloat() <= 1000.0)                           // never above the slowest
+    let routes = o.get("routes")
+    assertEq(routes.at(0).getString("key", ""), "GET /items/{id}")
+    assertEq(Pulse.bucketOf(0.01), "q0")
+    let r = Pulse.bucketRange(Pulse.bucketOf(123.0), 0.0)
+    assert(r[0] < 123.0 && 123.0 <= r[1] && r[1] / r[0] < 1.1)
+    Pulse.recording = false
 }

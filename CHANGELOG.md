@@ -8,6 +8,12 @@ compiler versions it builds with.
 
 Needs grav 1.12.0 or newer.
 
+- Finer percentiles: about 170 latency buckets (each about 9% wider than the
+  last), percentiles placed within their bucket and capped by its slowest
+  request, and p75, p90 and p99.9 beside p50, p95 and p99 (`preciseLatency =
+  false` for the old buckets). Minutes recorded before still read.
+- Requests group by the matched route's pattern (`req.routeUri()`) when there is
+  one, instead of a guess from the path.
 - `PulsePackage`: the module connects itself to an apogee-framework app (apogee-package):
   its settings, wiring and commands moved here from the framework.
 - Its tables as a migration (`CreatePulseTables`, run by `migrate`); the store's own
