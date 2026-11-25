@@ -1,0 +1,45 @@
+// migration.grav — Pulse's tables (<prefix>aggregates: per-minute counts,
+// totals and maxima; <prefix>values: the latest value per key), as a
+// migration for `migrate`; DatabasePulseStore.createTables() makes the same.
+import "std"
+import "grav-db"
+import "grav-orbit"
+use db.*
+use orbit.*
+
+namespace apogee {
+
+    class CreatePulseTables extends Migration {
+        public prefix: string
+        constructor(prefix: string = "pulse_") { self.prefix = prefix; }
+        fn name() -> string { return "CreatePulseTables"; }
+        fn up() { CreatePulseTables.ensure(DB.connection(), self.prefix); }
+        fn down() { Schema.dropIfExists(self.prefix + "values"); Schema.dropIfExists(self.prefix + "aggregates"); }
+        static fn ensure(c: Connection, prefix: string) {
+            if (!Schema.hasTableOn(c, prefix + "aggregates")) {
+                Schema.createOn(c, prefix + "aggregates", fn(t: Blueprint) {
+                    t.bigInteger("minute");
+                    t.varchar("type", 32);
+                    t.varchar("key_hash", 64);
+                    t.longText("pkey");
+                    t.bigInteger("count");
+                    t.doublePrecision("total");
+                    t.doublePrecision("maximum");
+                    t.longText("last");
+                    t.primary(["minute", "type", "key_hash"]);
+                    t.index(["type", "minute"]);
+                });
+            }
+            if (!Schema.hasTableOn(c, prefix + "values")) {
+                Schema.createOn(c, prefix + "values", fn(t: Blueprint) {
+                    t.varchar("type", 32);
+                    t.varchar("key_hash", 64);
+                    t.longText("pkey");
+                    t.longText("value");
+                    t.bigInteger("updated_at");
+                    t.primary(["type", "key_hash"]);
+                });
+            }
+        }
+    }
+}

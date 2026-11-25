@@ -5,6 +5,7 @@
 // few seconds, so watching a busy app costs almost nothing per request.
 import "std"
 import "grav-db"
+import "migration.grav"
 use db.*
 
 namespace apogee {
@@ -172,20 +173,8 @@ namespace apogee {
             if (self.driver == "") { self.driver = c.driver(); }
             try { f(c); } finally { self.pool.release(c); }
         }
-        fn createTables() {
-            self.with(fn(c: Connection) {
-                let text = c.driver() == "mysql" ? "LONGTEXT" : "TEXT";
-                let dbl = c.driver() == "postgres" ? "DOUBLE PRECISION" : "DOUBLE";
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("aggregates") + " (minute BIGINT NOT NULL, type VARCHAR(32) NOT NULL, key_hash VARCHAR(64) NOT NULL, " +
-                       "pkey " + text + " NOT NULL, count BIGINT NOT NULL, total " + dbl + " NOT NULL, maximum " + dbl + " NOT NULL, last " + text + " NOT NULL, " +
-                       "PRIMARY KEY (minute, type, key_hash))");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("values") + " (type VARCHAR(32) NOT NULL, key_hash VARCHAR(64) NOT NULL, pkey " + text +
-                       " NOT NULL, value " + text + " NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY (type, key_hash))");
-                if (c.driver() != "mysql") {
-                    c.exec("CREATE INDEX IF NOT EXISTS " + self.t("aggregates") + "_type_minute ON " + self.t("aggregates") + " (type, minute)");
-                }
-            });
-        }
+        // Makes the tables (nothing for those there); in an app, `migrate` does (CreatePulseTables).
+        fn createTables() { self.with(fn(c: Connection) { CreatePulseTables.ensure(c, self.prefix); }); }
         private fn upsert() -> string {
             let a = self.t("aggregates");
             let base = "INSERT INTO " + a + " (minute, type, key_hash, pkey, count, total, maximum, last) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
